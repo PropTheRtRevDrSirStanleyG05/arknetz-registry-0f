@@ -1,0 +1,157 @@
+# ArkNetz registry write path — single source of truth.
+# Shard repos are dumb stores: a zstd-compressed JSON registry file
+# plus this workflow. Clients write by opening a PR against the
+# shard repo; this workflow validates the PR's registry and, when it
+# merges, commits the new registry back to main.
+#
+# Why PRs, not direct pushes:
+#   - The registry file is the entire database for one shard; a bad
+#     write corrupts every client that reads it.
+#   - GitHub gives us review, history and revert for free.
+#   - No server, no database, no standing credentials.
+#
+# A registry entry is one JSON object per line? No — the file is a
+# single JSON document:
+#   {
+#     "version": 1,
+#     "shard": "00",
+#     "updated": "2026-11-20T00:00:00Z",
+#     "entries": {
+#       "<name>": {
+#         "pubkey": "<base64 ed25519 public key>",
+#         "endpoint": "https://<host>[:port]/",
+#         "caps": ["..."],
+#         "added": "2026-11-20T00:00:00Z"
+#       }
+#     }
+#   }
+#
+# The compressed form is zstd with the shared dictionary
+# (arknetz-protocol/zstd-dictionary-v2.bin). Clients MUST decompress
+# with the dictionary; without it the file is opaque.
+#
+# Validation rules enforced here (and mirrored by clients):
+#   1. File must decompress with the v2 dictionary and parse as JSON.
+#   2. "version" must be 1, "shard" must match the repo's shard id.
+#   3. Entry names are 1-64 chars, [a-z0-9._-], no leading/trailing
+#      dot, dash or underscore.
+#   4. "pubkey" must be 44-char base64 (32-byte ed25519 key).
+#   5. "endpoint" must be https, host must resolve to a public IP
+#      (no localhost, no RFC1918, no link-local).
+#   6. Registry may only grow: entries present in main must still
+#      be present, with the same pubkey (removals are a separate,
+#      human-reviewed process).
+#   7. Total entries must stay under the shard cap (4096).
+#
+# Merging is the only write path: the workflow runs on pull_request
+# and, on merge to main, re-validates and re-compresses the registry
+# so main always holds the canonical compressed form.
+
+name: register
+
+on:
+  pull_request:
+    paths:
+      - "registry.json"
+      - "registry.json.zst"
+  push:
+    branches: [main]
+    paths:
+      - "registry.json"
+      - "registry.json.zst"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install zstd
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq zstd python3
+
+      - name: Fetch v2 dictionary
+        run: |
+          curl -fsSL -o /tmp/zstd-dictionary-v2.bin \
+            https://raw.githubusercontent.com/PropTheRtRevDrSirStanleyG05/arknetz-protocol/main/zstd-dictionary-v2.bin
+
+      - name: Validate registry
+        run: |
+          python3 - <<'PY'
+          import json, subprocess, sys, re, base64, ipaddress, socket
+
+          SHARD = "${{ github.event.repository.name }}".rsplit("-", 1)[-1]
+          CAP = 4096
+          NAME_RE = re.compile(r"^(?![._-])[a-z0-9._-]{1,64}(?<![._-])$")
+
+          def load(path):
+              out = subprocess.run(
+                  ["zstd", "-d", "-c", "--memory=32MB",
+                   "-D", "/tmp/zstd-dictionary-v2.bin", path],
+                  capture_output=True)
+              if out.returncode != 0:
+                  sys.exit(f"zstd decompress failed for {path}: {out.stderr.decode()[:500]}")
+              return json.loads(out.stdout)
+
+          def check(doc, label):
+              assert doc.get("version") == 1, f"{label}: version must be 1"
+              assert doc.get("shard") == SHARD, f"{label}: shard must be {SHARD}"
+              entries = doc.get("entries")
+              assert isinstance(entries, dict), f"{label}: entries must be an object"
+              assert len(entries) <= CAP, f"{label}: over shard cap {CAP}"
+              for name, e in entries.items():
+                  assert NAME_RE.match(name), f"{label}: bad entry name {name!r}"
+                  assert isinstance(e, dict), f"{label}: entry {name} must be an object"
+                  pk = e.get("pubkey", "")
+                  assert re.fullmatch(r"[A-Za-z0-9+/]{43}=", pk), f"{label}: {name} bad pubkey"
+                  base64.b64decode(pk, validate=True)
+                  ep = e.get("endpoint", "")
+                  assert ep.startswith("https://"), f"{label}: {name} endpoint must be https"
+                  host = ep[8:].split("/")[0].split(":")[0]
+                  assert host, f"{label}: {name} endpoint has no host"
+                  try:
+                      infos = socket.getaddrinfo(host, 443, proto=socket.IPPROTO_TCP)
+                  except socket.gaierror:
+                      sys.exit(f"{label}: {name} host does not resolve: {host}")
+                  for _fam, _t, _p, _c, sockaddr in infos:
+                      ip = ipaddress.ip_address(sockaddr[0])
+                      assert ip.is_global, f"{label}: {name} host resolves to non-public IP {ip}"
+              return entries
+
+          def entries_for(ref):
+              if ref:
+                  subprocess.run(["git", "show", f"{ref}:registry.json.zst"],
+                                 stdout=open("/tmp/base.zst", "wb"), check=True)
+                  return check(load("/tmp/base.zst"), "base")
+              return {}
+
+          new = check(load("registry.json.zst"), "new")
+          if "${{ github.event_name }}" == "pull_request":
+              base_ref = "${{ github.event.pull_request.base.sha }}"
+              old = entries_for(base_ref)
+              for name, e in old.items():
+                  assert name in new, f"entry {name} was removed"
+                  assert new[name].get("pubkey") == e.get("pubkey"), \
+                      f"entry {name} changed pubkey"
+              print(f"OK: {len(new)} entries, {len(new)-len(old)} added")
+          else:
+              print(f"OK: {len(new)} entries")
+          PY
+
+      - name: Recompress canonical form (main only)
+        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+        run: |
+          zstd -q -f -19 -D /tmp/zstd-dictionary-v2.bin \
+            -o registry.json.zst registry.json
+          git config user.name "arknetz-bot"
+          git config user.email "arknetz-bot@users.noreply.github.com"
+          git add registry.json.zst
+          git diff --cached --quiet || git commit -m "Canonical recompress of registry.json.zst"
+          git push
