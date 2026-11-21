@@ -73,17 +73,17 @@ jobs:
               out.write(f"claimant={os.environ['ISSUE_USER']}\n")
           PY
 
-      - name: Ensure zstd and fetch the v2 dictionary
+      - name: Ensure zstd is available
         run: |
           if ! command -v zstd >/dev/null 2>&1; then sudo apt-get update -qq && sudo apt-get install -y -qq zstd; fi
-          # Canonical shard files are compressed WITH the v2 dictionary
-          # (frame carries dict ID 0x41524B02). A bare `zstd -d` on one
-          # fails with "Dictionary mismatch", so the availability check
-          # below and the recompress step both need the dictionary.
-          # Fetched from the protocol repo (public, raw); if the fetch
-          # fails the steps below fall back to plain zstd and to the
-          # plain registry.json mirror, so a claim is never lost.
-          curl -fsSL -o zstd-dictionary-v2.bin https://raw.githubusercontent.com/PropTheRtRevDrSirStanleyG05/arknetz-protocol/main/zstd-dictionary-v2.bin || rm -f zstd-dictionary-v2.bin
+          # Canonical shard files are PLAIN zstd since 2026-11-21: the
+          # v2 dictionary was dropped (benchmark proved it saves zero
+          # bytes), so a bare `zstd -d` reads every canonical file and
+          # no dictionary is fetched. Old dictionary-compressed frames
+          # still decode in the app, but this workflow never writes
+          # them — if a shard still holds one, the availability check
+          # below falls back to the plain registry.json mirror, and
+          # the recompress step below rewrites it as plain zstd.
 
       - name: Check banned words and availability
         id: check
@@ -127,13 +127,14 @@ jobs:
           # Availability: decompress the canonical shard and look the
           # domain up. A missing shard file means nothing is registered
           # in this shard yet, so the domain is available.
-          # The canonical .zst is compressed WITH the v2 dictionary —
-          # decompress with it when we have it; a bare `zstd -d` on a
-          # dict frame fails with "Dictionary mismatch".
+          # Canonical files are plain zstd (dictionary dropped
+          # 2026-11-21), so a bare `zstd -d` reads them. A shard that
+          # still holds an old dictionary-compressed frame fails here
+          # with "Dictionary mismatch" and falls through to the plain
+          # registry.json mirror below — the claim is never lost, and
+          # the recompress step rewrites the shard as plain zstd.
           entries = {}
           zst_cmd = ["zstd", "-d", "-c", "registry.json.zst"]
-          if os.path.exists("zstd-dictionary-v2.bin"):
-              zst_cmd = ["zstd", "-d", "-D", "zstd-dictionary-v2.bin", "-c", "registry.json.zst"]
           try:
               raw = subprocess.run(zst_cmd, capture_output=True, check=True).stdout
               data = json.loads(raw)
@@ -215,13 +216,10 @@ jobs:
           with open("registry.json", "w") as f:
               json.dump(entries, f, indent=2, sort_keys=True)
               f.write("\n")
-          # Recompress WITH the v2 dictionary when we have it, so the
-          # canonical file keeps the dict ID every reader expects.
-          # Without it, plain zstd (the app reads both, but the
-          # canonical form stays dictionary-compressed).
+          # Recompress as PLAIN zstd (dictionary dropped 2026-11-21).
+          # The app reads both plain and old dictionary frames, but
+          # the canonical form is plain from here on.
           zst_cmd = ["zstd", "-q", "-f", "registry.json", "-o", "registry.json.zst"]
-          if os.path.exists("zstd-dictionary-v2.bin"):
-              zst_cmd = ["zstd", "-q", "-D", "zstd-dictionary-v2.bin", "-f", "registry.json", "-o", "registry.json.zst"]
           subprocess.run(zst_cmd, check=True)
           PY
           git config user.name "arknetz-register-bot"
